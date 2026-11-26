@@ -11,6 +11,7 @@
 #include <atomic>
 #include <climits>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -20,11 +21,17 @@
 #include <unordered_map>
 #include <vector>
 
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+
+#include <linux/dma-heap.h>
 #include <linux/videodev2.h>
 
 #include <libcamera/base/log.h>
 #include <libcamera/base/mutex.h>
 #include <libcamera/base/signal.h>
+#include <libcamera/base/span.h>
 #include <libcamera/base/thread.h>
 #include <libcamera/base/utils.h>
 
@@ -33,12 +40,12 @@
 #include <libcamera/formats.h>
 #include <libcamera/framebuffer.h>
 #include <libcamera/geometry.h>
+#include <libcamera/version.h>
 #include <libcamera/property_ids.h>
 #include <libcamera/stream.h>
 
 #include "libcamera/internal/camera.h"
 #include "libcamera/internal/device_enumerator.h"
-#include "libcamera/internal/dma_buf_allocator.h"
 #include "libcamera/internal/formats.h"
 #include "libcamera/internal/framebuffer.h"
 #include "libcamera/internal/media_device.h"
@@ -47,6 +54,20 @@
 #include "libcamera/internal/v4l2_pixelformat.h"
 
 #include <api/ICamera.h>
+
+/*
+ * libcamera releases before 0.4 (tested with 0.2.0) differ in a few places:
+ * no acquireDevice()/cancelRequest() hooks, the CameraLocation* property
+ * names, the request metadata accessor and dispatchMessages() signature.
+ */
+#if LIBCAMERA_VERSION_MAJOR == 0 && LIBCAMERA_VERSION_MINOR < 4
+#define ICAMHAL_OLD_LIBCAMERA 1
+#endif
+
+/* acquireDevice() and the two-argument registration macro arrived in 0.3. */
+#if LIBCAMERA_VERSION_MAJOR == 0 && LIBCAMERA_VERSION_MINOR < 3
+#define ICAMHAL_V02 1
+#endif
 
 namespace libcamera {
 
@@ -60,10 +81,91 @@ constexpr unsigned int kBufferCount = 8;
 constexpr unsigned int kStrideAlign = 64;
 constexpr unsigned int kMaxDequeueFailures = 3;
 
+#ifdef ICAMHAL_OLD_LIBCAMERA
+using RoleSpan = Span<const StreamRole>;
+constexpr auto kLocationFront = properties::CameraLocationFront;
+constexpr auto kLocationBack = properties::CameraLocationBack;
+constexpr auto kLocationExternal = properties::CameraLocationExternal;
+#else
+using RoleSpan = std::span<const StreamRole>;
+constexpr auto kLocationFront = properties::LocationFront;
+constexpr auto kLocationBack = properties::LocationBack;
+constexpr auto kLocationExternal = properties::LocationExternal;
+#endif
+
+bool endsWith(const std::string &str, const std::string &suffix)
+{
+	return str.size() >= suffix.size() &&
+	       str.compare(str.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
 struct SupportedMode {
 	PixelFormat format;
 	Size size;
 	icamera::stream_t halStream;
+};
+
+
+/*
+ * Minimal dma-heap allocator. libcamera releases older than 0.4 have no
+ * DmaBufAllocator, so the handler carries its own to build on both.
+ * All planes of a buffer share a single dma-buf.
+ */
+class HeapAllocator
+{
+public:
+	HeapAllocator()
+	{
+		static const char *const heaps[] = {
+			"/dev/dma_heap/reserved",
+			"/dev/dma_heap/system",
+		};
+
+		for (const char *path : heaps) {
+			heapFd_ = UniqueFD(::open(path, O_RDWR | O_CLOEXEC, 0));
+			if (heapFd_.isValid())
+				break;
+		}
+	}
+
+	bool isValid() const { return heapFd_.isValid(); }
+
+	int exportBuffers(unsigned int count,
+			  const std::vector<unsigned int> &planeSizes,
+			  std::vector<std::unique_ptr<FrameBuffer>> *buffers)
+	{
+		unsigned int frameSize = 0;
+		for (unsigned int size : planeSizes)
+			frameSize += size;
+
+		for (unsigned int i = 0; i < count; i++) {
+			struct dma_heap_allocation_data data = {};
+			data.len = frameSize;
+			data.fd_flags = O_RDWR | O_CLOEXEC;
+
+			if (::ioctl(heapFd_.get(), DMA_HEAP_IOCTL_ALLOC, &data)) {
+				LOG(ICamHal, Error)
+					<< "dma-heap allocation failed: " << strerror(errno);
+				buffers->clear();
+				return -errno;
+			}
+
+			SharedFD fd(UniqueFD(data.fd));
+			std::vector<FrameBuffer::Plane> planes;
+			unsigned int offset = 0;
+			for (unsigned int size : planeSizes) {
+				planes.emplace_back(FrameBuffer::Plane{ fd, offset, size });
+				offset += size;
+			}
+
+			buffers->push_back(std::make_unique<FrameBuffer>(planes));
+		}
+
+		return count;
+	}
+
+private:
+	UniqueFD heapFd_;
 };
 
 } /* namespace */
@@ -99,6 +201,7 @@ public:
 
 	icamera::stream_t halStream_ = {};
 	bool halStarted_ = false;
+	bool halOpen_ = false;
 	std::atomic<bool> running_ = false;
 	bool failed_ = false;
 
@@ -137,7 +240,7 @@ public:
 	bool match(DeviceEnumerator *enumerator) override;
 
 	std::unique_ptr<CameraConfiguration>
-	generateConfiguration(Camera *camera, std::span<const StreamRole> roles) override;
+	generateConfiguration(Camera *camera, RoleSpan roles) override;
 	int configure(Camera *camera, CameraConfiguration *config) override;
 
 	int exportFrameBuffers(Camera *camera, Stream *stream,
@@ -147,7 +250,9 @@ public:
 	void stopDevice(Camera *camera) override;
 	int queueRequestDevice(Camera *camera, Request *request) override;
 
+#ifndef ICAMHAL_V02
 	bool acquireDevice(Camera *camera) override;
+#endif
 	void releaseDevice(Camera *camera) override;
 
 private:
@@ -156,13 +261,13 @@ private:
 		return static_cast<ICamHalCameraData *>(camera->_d());
 	}
 
+	bool openHal(ICamHalCameraData *data);
+	void cancelQueuedRequests(ICamHalCameraData *data);
 	int startHal(ICamHalCameraData *data);
 	void onBufferReady(FrameBuffer *buffer, uint64_t timestamp,
 			   uint32_t sequence, bool success);
 
-	DmaBufAllocator dmaBufAllocator_{ DmaBufAllocator::DmaBufAllocatorFlag::CmaHeap |
-					  DmaBufAllocator::DmaBufAllocatorFlag::SystemHeap |
-					  DmaBufAllocator::DmaBufAllocatorFlag::UDmaBuf };
+	HeapAllocator dmaBufAllocator_;
 	void onDeviceError(ICamHalCameraData *data);
 
 	static bool created_;
@@ -208,17 +313,17 @@ int ICamHalCameraData::init(const icamera::camera_info_t &info)
 	properties_.set(properties::Model, name_);
 
 	/* The HAL follows the Android convention: 0 back, 1 front, 2 external. */
-	int32_t location = properties::LocationExternal;
+	int32_t location = kLocationExternal;
 	if (info.facing == 0)
-		location = properties::LocationBack;
+		location = kLocationBack;
 	else if (info.facing == 1)
-		location = properties::LocationFront;
+		location = kLocationFront;
 
 	/* The profiles report facing 0 for everything; the name suffix is accurate. */
-	if (name_.ends_with("-uf"))
-		location = properties::LocationFront;
-	else if (name_.ends_with("-wf"))
-		location = properties::LocationBack;
+	if (endsWith(name_, "-uf"))
+		location = kLocationFront;
+	else if (endsWith(name_, "-wf"))
+		location = kLocationBack;
 	properties_.set(properties::Location, location);
 
 	return 0;
@@ -245,7 +350,7 @@ void ICamHalCameraData::run()
 
 	while (running_) {
 		icamera::camera_buffer_t *halBuf = nullptr;
-		int ret = icamera::camera_stream_dqbuf(halId_, 0, &halBuf);
+		int ret = icamera::camera_stream_dqbuf(halId_, halStream_.id, &halBuf);
 		if (ret != 0 || !halBuf) {
 			if (!running_)
 				break;
@@ -419,7 +524,13 @@ bool PipelineHandlerICamHal::match(DeviceEnumerator *enumerator)
 	 * that has an entity in the IPU6 media graph.
 	 */
 	DeviceMatch dm("intel-ipu6");
-	std::shared_ptr<MediaDevice> media = enumerator->search(dm);
+#ifdef ICAMHAL_OLD_LIBCAMERA
+	/* registerCamera() requires the handler to own a media device. */
+	MediaDevice *media = acquireMediaDevice(enumerator, dm);
+#else
+	std::shared_ptr<MediaDevice> mediaRef = enumerator->search(dm);
+	MediaDevice *media = mediaRef.get();
+#endif
 	std::set<std::string> seen;
 
 	for (int i = 0; i < num; i++) {
@@ -427,7 +538,7 @@ bool PipelineHandlerICamHal::match(DeviceEnumerator *enumerator)
 		if (icamera::get_camera_info(i, info) != 0)
 			continue;
 
-		if (!info.name || !sensorPresent(media.get(), info.name) ||
+		if (!info.name || !sensorPresent(media, info.name) ||
 		    !seen.insert(info.name).second)
 			continue;
 
@@ -448,7 +559,7 @@ bool PipelineHandlerICamHal::match(DeviceEnumerator *enumerator)
 
 std::unique_ptr<CameraConfiguration>
 PipelineHandlerICamHal::generateConfiguration(Camera *camera,
-					      std::span<const StreamRole> roles)
+					      RoleSpan roles)
 {
 	ICamHalCameraData *data = cameraData(camera);
 	auto config = std::make_unique<ICamHalCameraConfiguration>(data);
@@ -501,6 +612,9 @@ int PipelineHandlerICamHal::configure(Camera *camera, CameraConfiguration *confi
 	if (!mode)
 		return -EINVAL;
 
+	if (!openHal(data))
+		return -ENODEV;
+
 	icamera::stream_t s = mode->halStream;
 	s.field = V4L2_FIELD_ANY;
 	s.memType = V4L2_MEMORY_DMABUF;
@@ -551,9 +665,10 @@ int PipelineHandlerICamHal::exportFrameBuffers([[maybe_unused]] Camera *camera, 
 	return dmaBufAllocator_.exportBuffers(cfg.bufferCount, planeSizes, buffers);
 }
 
-bool PipelineHandlerICamHal::acquireDevice(Camera *camera)
+bool PipelineHandlerICamHal::openHal(ICamHalCameraData *data)
 {
-	ICamHalCameraData *data = cameraData(camera);
+	if (data->halOpen_)
+		return true;
 
 	int ret = icamera::camera_device_open(data->halId_);
 	if (ret != 0) {
@@ -561,12 +676,39 @@ bool PipelineHandlerICamHal::acquireDevice(Camera *camera)
 		return false;
 	}
 
+	data->halOpen_ = true;
 	return true;
 }
 
+#ifndef ICAMHAL_V02
+bool PipelineHandlerICamHal::acquireDevice(Camera *camera)
+{
+	return openHal(cameraData(camera));
+}
+#endif
+
 void PipelineHandlerICamHal::releaseDevice(Camera *camera)
 {
-	icamera::camera_device_close(cameraData(camera)->halId_);
+	ICamHalCameraData *data = cameraData(camera);
+
+	if (!data->halOpen_)
+		return;
+
+	icamera::camera_device_close(data->halId_);
+	data->halOpen_ = false;
+}
+
+void PipelineHandlerICamHal::cancelQueuedRequests(ICamHalCameraData *data)
+{
+	while (!data->queuedRequests_.empty()) {
+		Request *request = data->queuedRequests_.front();
+#ifdef ICAMHAL_OLD_LIBCAMERA
+		request->_d()->cancel();
+		completeRequest(request);
+#else
+		cancelRequest(request);
+#endif
+	}
 }
 
 /*
@@ -612,7 +754,11 @@ void PipelineHandlerICamHal::stopDevice(Camera *camera)
 		data->wait();
 
 		/* Deliver completions already queued to this thread. */
+		#ifdef ICAMHAL_OLD_LIBCAMERA
+		thread()->dispatchMessages(Message::Type::InvokeMessage);
+#else
 		thread()->dispatchMessages(Message::Type::InvokeMessage, this);
+#endif
 		data->bufferReady.disconnect(this);
 		data->deviceError.disconnect(this);
 		data->halStarted_ = false;
@@ -624,8 +770,7 @@ void PipelineHandlerICamHal::stopDevice(Camera *camera)
 		data->bufferMap_.clear();
 	}
 
-	while (!data->queuedRequests_.empty())
-		cancelRequest(data->queuedRequests_.front());
+	cancelQueuedRequests(data);
 }
 
 int PipelineHandlerICamHal::queueRequestDevice(Camera *camera, Request *request)
@@ -642,7 +787,7 @@ int PipelineHandlerICamHal::queueRequestDevice(Camera *camera, Request *request)
 		return -ENODEV;
 
 	/* The HAL takes a single fd with the planes laid out contiguously. */
-	std::span<const FrameBuffer::Plane> planes = buffer->planes();
+	const auto &planes = buffer->planes();
 	unsigned int capacity = 0;
 	for (const FrameBuffer::Plane &p : planes) {
 		if (p.fd.get() != planes[0].fd.get() || p.offset != capacity) {
@@ -693,8 +838,7 @@ void PipelineHandlerICamHal::onDeviceError(ICamHalCameraData *data)
 	data->failed_ = true;
 	icamera::camera_device_stop(data->halId_);
 
-	while (!data->queuedRequests_.empty())
-		cancelRequest(data->queuedRequests_.front());
+	cancelQueuedRequests(data);
 }
 
 void PipelineHandlerICamHal::onBufferReady(FrameBuffer *buffer, uint64_t timestamp,
@@ -708,17 +852,26 @@ void PipelineHandlerICamHal::onBufferReady(FrameBuffer *buffer, uint64_t timesta
 	fmd.timestamp = timestamp;
 
 	/* The HAL writes one contiguous image; report it all on the plane(s). */
-	std::span<const FrameBuffer::Plane> planes = buffer->planes();
+	const auto &planes = buffer->planes();
 	for (const auto [i, p] : utils::enumerate(planes))
 		fmd.planes()[i].bytesused = p.length;
 
+#ifdef ICAMHAL_OLD_LIBCAMERA
+	request->metadata().set(controls::SensorTimestamp,
+				static_cast<int64_t>(timestamp));
+#else
 	request->_d()->metadata().set(controls::SensorTimestamp,
 				      static_cast<int64_t>(timestamp));
+#endif
 
 	if (completeBuffer(request, buffer))
 		completeRequest(request);
 }
 
+#ifdef ICAMHAL_V02
+REGISTER_PIPELINE_HANDLER(PipelineHandlerICamHal)
+#else
 REGISTER_PIPELINE_HANDLER(PipelineHandlerICamHal, "icamhal")
+#endif
 
 } /* namespace libcamera */
